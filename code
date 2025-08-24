@@ -1,0 +1,200 @@
+% compare_beamforming.m
+% Compare: (1) Fully-digital SVD (benchmark),
+%          (2) Hybrid OMP,
+%          (3) Codebook Beam Selection,
+%          (4) Hybrid Alternating Minimization (AltMin)
+clear; close all; clc;
+
+%% ---------- USER OPTIONS ----------
+numRealizations = 100;         % number of channel draws
+Nt = 64; Nr = 16;              % antenna sizes (Tx, Rx)
+Ns = 1;                        % number of data streams (single-stream case)
+Nrf_tx = 4; Nrf_rx = 4;        % RF chains (for hybrid)
+SNR_dB_list = [0, 10, 20];     % SNR points to evaluate
+L = 3;                         % number of paths for synthetic generator
+d_over_lambda = 0.5;           % ULA spacing (lambda/2)
+
+%% Codebook for codebook-based baseline (DFT)
+Ft_cb = dft_codebook(Nt);      % Nt x Nt DFT codebook
+Wr_cb = dft_codebook(Nr);      % Nr x Nr
+
+%% Generate synthetic channels
+Hs = cell(numRealizations,1);  % each H is Nr x Nt
+rng(0); % reproducible
+for idx = 1:numRealizations
+    AoD_deg = -60 + 120*rand(L,1); % random AoDs in [-60,60]
+    AoA_deg = -60 + 120*rand(L,1);
+    alpha = (randn(L,1)+1j*randn(L,1))./sqrt(2*L);
+    Hs{idx} = mmwave_channel(Nt,Nr,L,AoD_deg,AoA_deg,alpha,d_over_lambda);
+end
+
+%% Pre-allocate results
+R_svd = zeros(numel(SNR_dB_list), numRealizations);
+R_omp = zeros(size(R_svd));
+R_cb  = zeros(size(R_svd));
+R_alt = zeros(size(R_svd));   % AltMin hybrid
+
+%% Run experiments
+for r = 1:numRealizations
+    H = Hs{r};           % Nr x Nt
+    [U,~,V] = svd(H);
+    F_opt = V(:,1:Ns);   % Nt x Ns
+    W_opt = U(:,1:Ns);   % Nr x Ns
+
+    % Precompute dictionaries (use chosen spacing)
+    Gt = steering_dictionary(Nt, 181, d_over_lambda);
+    Gr = steering_dictionary(Nr, 181, d_over_lambda);
+
+    % 1) OMP hybrid design
+    [Frf_omp, Fbb_omp] = hybrid_omp_precoder(H, Ns, Nrf_tx, Gt, F_opt);
+    [Wrf_omp, Wbb_omp] = hybrid_omp_combiner(H, Ns, Nrf_rx, Gr, W_opt);
+
+    % 2) Codebook beam selection
+    [f_cb, w_cb] = codebook_beam_selection(H, Ft_cb, Wr_cb);
+
+    % 3) Hybrid Alternating Minimization (AltMin)
+    [Frf_alt, Fbb_alt] = altmin_precoder(F_opt, Nrf_tx, 20); % 20 iterations
+    [Wrf_alt, Wbb_alt] = altmin_precoder(W_opt, Nrf_rx, 20);
+
+    % Evaluate all at each SNR
+    for sIdx = 1:numel(SNR_dB_list)
+        SNRdB = SNR_dB_list(sIdx); SNR = 10^(SNRdB/10);
+        Pt = SNR; sigma2 = 1;
+
+        % 1) Fully-digital SVD
+        eff1 = Pt * abs(W_opt(:,1)' * H * F_opt(:,1))^2;
+        R_svd(sIdx,r) = log2(1 + eff1/sigma2);
+
+        % 2) OMP Hybrid
+        Fh = Frf_omp * Fbb_omp; Fh = Fh/norm(Fh,'fro')*sqrt(Ns);
+        Wh = Wrf_omp * Wbb_omp;
+        eff2 = Pt * abs(Wh(:,1)' * H * Fh(:,1))^2;
+        R_omp(sIdx,r) = log2(1 + eff2/sigma2);
+
+        % 3) Codebook
+        eff3 = Pt * abs(w_cb' * H * f_cb)^2;
+        R_cb(sIdx,r) = log2(1 + eff3/sigma2);
+
+        % 4) AltMin Hybrid
+        Fh2 = Frf_alt * Fbb_alt; Fh2 = Fh2/norm(Fh2,'fro')*sqrt(Ns);
+        Wh2 = Wrf_alt * Wbb_alt;
+        eff4 = Pt * abs(Wh2(:,1)' * H * Fh2(:,1))^2;
+        R_alt(sIdx,r) = log2(1 + eff4/sigma2);
+    end
+end
+
+%% Aggregate and show results
+mean_svd = mean(R_svd,2);
+mean_omp = mean(R_omp,2);
+mean_cb  = mean(R_cb,2);
+mean_alt = mean(R_alt,2);
+
+fprintf('\nAverage spectral efficiency (bps/Hz) over %d realizations\n', numRealizations);
+fprintf('SNR(dB)    SVD (ideal)    OMP Hybrid    Codebook    AltMin Hybrid\n');
+for k=1:numel(SNR_dB_list)
+    fprintf('%4d     %8.3f     %8.3f     %8.3f     %8.3f\n', ...
+        SNR_dB_list(k), mean_svd(k), mean_omp(k), mean_cb(k), mean_alt(k));
+end
+
+% Plot
+figure; plot(SNR_dB_list, mean_svd,'-o', ...
+             SNR_dB_list, mean_omp,'-s', ...
+             SNR_dB_list, mean_cb,'-d', ...
+             SNR_dB_list, mean_alt,'-^','LineWidth',1.6);
+grid on; xlabel('SNR (dB)'); ylabel('Average Spectral Efficiency (bps/Hz)');
+legend('Fully-digital SVD','Hybrid OMP','Codebook sweep','AltMin Hybrid','Location','best');
+title('Beamforming comparison');
+
+%% -------------------- FUNCTIONS --------------------
+
+function F = dft_codebook(N)
+    F = zeros(N,N);
+    for k = 0:N-1
+        F(:,k+1) = exp(-1j*2*pi*(0:N-1)'*k/N)/sqrt(N);
+    end
+end
+
+function A = steering_dictionary(N, gridPoints, d_over_lambda)
+    angs = linspace(-90,90,gridPoints);
+    A = zeros(N, numel(angs));
+    for i=1:numel(angs)
+        A(:,i) = exp(1j*2*pi*(0:N-1)'*d_over_lambda*deg2rad_sin(angs(i)))/sqrt(N);
+    end
+end
+
+function s = deg2rad_sin(deg)
+    % helper to support older MATLAB (deg2rad sometimes missing)
+    s = sin(deg*pi/180);
+end
+
+function H = mmwave_channel(Nt,Nr,L,AoD_deg,AoA_deg,alpha,d_over_lambda)
+    H = zeros(Nr,Nt);
+    for l=1:L
+        at = exp(1j*2*pi*d_over_lambda*(0:Nt-1)'*sin(AoD_deg(l)*pi/180))/sqrt(Nt);
+        ar = exp(1j*2*pi*d_over_lambda*(0:Nr-1)'*sin(AoA_deg(l)*pi/180))/sqrt(Nr);
+        H = H + alpha(l) * (ar * at');
+    end
+    H = H * sqrt(Nt*Nr/L);
+end
+
+function [Frf, Fbb] = altmin_precoder(Fopt, Nrf, maxIter)
+    [Nt,Ns] = size(Fopt);
+    % Initialize RF precoder with random phases
+    Frf = exp(1j*2*pi*rand(Nt,Nrf)); 
+    
+    for iter=1:maxIter
+        % Step 1: Digital baseband via LS (with regularization)
+        Fbb = (Frf' * Frf + 1e-6*eye(Nrf)) \ (Frf' * Fopt);
+        
+        % Step 2: Normalize power
+        normF = norm(Frf*Fbb,'fro');
+        Fbb = sqrt(Ns) * Fbb / normF;
+        
+        % Step 3: Update RF precoder and project onto constant modulus
+        Frf = Fopt*Fbb' / (Fbb*Fbb' + 1e-6*eye(Nrf));
+        Frf = exp(1j*angle(Frf));  % keep only phases
+    end
+end
+
+function [Frf, Fbb] = hybrid_omp_precoder(H, Ns, Nrf, Gt, Fopt) %#ok<INUSD>
+    % OMP to approximate Fopt using the transmit dictionary Gt
+    Nt = size(Gt,1); G = size(Gt,2);
+    Frf = zeros(Nt, Nrf); Fres = Fopt; selected = false(G,1); Phi = Gt;
+    for m = 1:Nrf
+        corr = zeros(G,1);
+        for g = 1:G
+            if selected(g); corr(g)=-Inf; continue; end
+            corr(g) = norm(Phi(:,g)'*Fres,'fro');
+        end
+        [~,best] = max(corr);
+        selected(best)=true; Frf(:,m) = Phi(:,best);
+        Fbb_temp = pinv(Frf(:,1:m)) * Fopt;
+        Fres = Fopt - Frf(:,1:m)*Fbb_temp;
+    end
+    Fbb = pinv(Frf)*Fopt;
+end
+
+function [Wrf, Wbb] = hybrid_omp_combiner(H, Ns, Nrf, Gr, Wopt) %#ok<INUSD>
+    % OMP-like combiner using receiver dictionary Gr to approximate Wopt
+    Nr = size(Gr,1); G = size(Gr,2);
+    Wrf = zeros(Nr,Nrf); Wres = Wopt; selected=false(G,1); Phi=Gr;
+    for m = 1:Nrf
+        corr = zeros(G,1);
+        for g=1:G
+            if selected(g); corr(g)=-Inf; continue; end
+            corr(g)=norm(Phi(:,g)'*Wres,'fro');
+        end
+        [~,best]=max(corr);
+        selected(best)=true; Wrf(:,m)=Phi(:,best);
+        Wbb_temp = pinv(Wrf(:,1:m))*Wopt;
+        Wres = Wopt - Wrf(:,1:m)*Wbb_temp;
+    end
+    Wbb = pinv(Wrf)*Wopt;
+end
+
+function [f_best,w_best] = codebook_beam_selection(H,Ft_cb,Wr_cb)
+    P = abs(Wr_cb' * H * Ft_cb).^2;
+    [~, idx] = max(P(:));
+    [ir,it] = ind2sub(size(P), idx);
+    f_best = Ft_cb(:,it); w_best = Wr_cb(:,ir);
+end
